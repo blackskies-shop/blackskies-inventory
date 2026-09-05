@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
 import { Alert, AlertTitle } from "@/components/ui/alert";
 import { FileUploadGrid } from "./FileUploadGrid";
@@ -7,17 +7,54 @@ import { StockTable } from "./StockTable";
 import { RecommendationsTable } from "./RecommendationsTable";
 import { useFileProcessing } from "@/hooks/useFileProcessing";
 import { Tabs } from "./ui/tabs";
-import { RotateCcw } from "lucide-react";
+import { Loader2, RotateCcw } from "lucide-react";
 import { LoadingOverlay } from "./ui/loading-overlay";
 import { TimelineType } from "@/types/common";
 import { FBAStockTable } from "./FBAStockTable";
 import { parseFile } from "@/utils/fileParser";
 import { processSellerboardStock } from "@/utils/processors/sellerboardStockProcessor";
+import { calculateStockRecommendations } from "@/utils/calculators/stockRecommendations";
 import { ProcessedSellerboardStock } from "@/types/processors";
-import { storeFiles, getFiles, storeData, getStoredData, clearFiles, clearStoredData, storeGenericData, getGenericData, clearGenericData, storeBlacklist, getBlacklist } from '@/lib/indexedDB';
+import { ArticleRecommendation } from "@/types/sales";
+import { storeFiles, getFiles, getStoredData, clearFiles, storeGenericData, getGenericData, clearGenericData, storeBlacklist, getBlacklist } from '@/lib/indexedDB';
+import {
+  clearRetaggingResult,
+  clearZfsSettings,
+  clearFbaSettings,
+  clearFbaTablesData,
+  loadRetaggingState,
+  loadFbaSettings,
+  loadZfsSettings,
+  resetFbaData,
+  saveRetaggingShopifyStockFile,
+  saveRetaggingShopifySkuEanFile,
+  loadStockReturnState,
+  saveStockReturnShopifyStockFile,
+  saveStockReturnShopifySkuEanFile,
+  clearStockReturnResult,
+  clearBarcodeShopifyState,
+  loadBarcodeShopifyState,
+  saveBarcodeShopifyState,
+  saveFbaProcessedData,
+  saveZfsCoverageDays,
+  saveZfsSafetyFactor,
+  saveZfsTrendFactor
+} from '@/lib/appPersistence';
 import { FileState, ParsedData } from "@/types/stock";
 import RelativeStockTable from "./RelativeStockTable";
 import BlacklistModal from "./BlacklistModal";
+import { RetaggingDecisionTool } from "./RetaggingDecisionTool";
+import { ZalandoSalePriceTool } from "./ZalandoSalePriceTool";
+import { StockReturnTool } from "./StockReturnTool";
+import { BarcodePdfTool } from "./BarcodePdfTool";
+import {
+  BarcodeBrand,
+  BarcodeCsvResult,
+  ShopifyBarcodeApiError,
+  ShopifyBarcodeApiResponse,
+} from "@/types/barcode";
+import { processShopifyBarcodeRows } from "@/utils/processors/barcodeCsvProcessor";
+import { useAuthenticatedFetch } from "@/hooks/useAuthenticatedFetch";
 
 interface TabContentProps {
   files: any;
@@ -37,6 +74,13 @@ interface TabContentProps {
   tabsRef: any;
   onOpenBlacklist: () => void;
   blacklistCount: number;
+  zfsRecommendationSettingsLoaded: boolean;
+  zfsCoverageDays: number;
+  zfsSafetyFactor: number;
+  zfsTrendFactor: number;
+  onZfsCoverageDaysChange: (days: number) => void;
+  onZfsSafetyFactorChange: (value: number) => void;
+  onZfsTrendFactorChange: (value: number) => void;
 }
 
 const ZFSContent: React.FC<TabContentProps> = ({
@@ -57,7 +101,29 @@ const ZFSContent: React.FC<TabContentProps> = ({
   tabsRef,
   onOpenBlacklist,
   blacklistCount,
+  zfsRecommendationSettingsLoaded,
+  zfsCoverageDays,
+  zfsSafetyFactor,
+  zfsTrendFactor,
+  onZfsCoverageDaysChange,
+  onZfsSafetyFactorChange,
+  onZfsTrendFactorChange,
 }) => {
+  const hasAnyZfsInput =
+    Boolean(files.internal) ||
+    Boolean(files.skuEanMapper) ||
+    Boolean(files.zfsSales) ||
+    (Array.isArray(files.zfs) && files.zfs.length > 0) ||
+    (Array.isArray(files.zfsShipments) && files.zfsShipments.length > 0) ||
+    (Array.isArray(files.zfsShipmentsReceived) && files.zfsShipmentsReceived.length > 0);
+  const isTimelineMissing = Boolean(files.zfsSales) && timeline === "none";
+  const isProcessDisabled = isProcessing || !hasAnyZfsInput || isTimelineMissing;
+  const processButtonLabel = !hasAnyZfsInput
+    ? "Upload Files"
+    : isTimelineMissing
+      ? "Select Timeline"
+      : "Process Files";
+
   const tabs = [
     {
       id: "stock",
@@ -71,76 +137,113 @@ const ZFSContent: React.FC<TabContentProps> = ({
       id: "recommendations",
       label: "ZFS Stock Recommendation",
       content:
-        recommendations.length > 0 ? (
+        zfsRecommendationSettingsLoaded && recommendations.length > 0 ? (
           <RecommendationsTable
             recommendations={recommendations}
             stockData={parsedData.integrated}
-            parsedData={parsedData}
             timeline={timeline}
+            coverageDays={zfsCoverageDays}
+            safetyFactor={zfsSafetyFactor}
+            trendFactor={zfsTrendFactor}
+            onCoverageDaysChange={onZfsCoverageDaysChange}
+            onSafetyFactorChange={onZfsSafetyFactorChange}
+            onTrendFactorChange={onZfsTrendFactorChange}
           />
         ) : null,
     },
   ];
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       {error && (
         <Alert variant="destructive">
           <AlertTitle>{error}</AlertTitle>
         </Alert>
       )}
 
-      <FileUploadGrid
-        files={files}
-        onFileChange={handleFileChange}
-        onFileRemove={handleRemoveFile}
-        timeline={timeline}
-        onTimelineChange={setTimeline}
-      />
+      <section className="ops-surface rounded-[8px] p-5">
+        <FileUploadGrid
+          files={files}
+          onFileChange={handleFileChange}
+          onFileRemove={handleRemoveFile}
+          timeline={timeline}
+          onTimelineChange={setTimeline}
+        />
+      </section>
 
-      <div className="flex justify-between items-center">
-        <div className="flex gap-3">
-          <button
-            onClick={resetFiles}
-            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-gray-700 bg-white border-2 border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-all duration-200"
-          >
-            <RotateCcw className="w-4 h-4" />
-            Reset Files
-          </button>
-          <button
-            onClick={onOpenBlacklist}
-            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-gray-700 bg-white border-2 border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-all duration-200"
-          >
-            Manage Blacklist
-            {blacklistCount > 0 && (
-              <span className="inline-flex items-center justify-center rounded-full bg-black px-2 py-0.5 text-xs font-semibold text-white min-w-[20px]">
-                {blacklistCount}
-              </span>
-            )}
-          </button>
-          {showTabs && (
-            <button
-              onClick={clearTables}
-              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-red-700 bg-white border-2 border-red-200 rounded-lg hover:bg-red-50 hover:border-red-300 transition-all duration-200"
-            >
-              Clear Tables
-            </button>
-          )}
+      <section className="ops-surface rounded-[8px]">
+        <div className="ops-section-header flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h3 className="ops-title">ZFS Operations</h3>
+            <p className="ops-muted">Process uploaded stock, shipment, mapper, and sales files together.</p>
+          </div>
+          <span className="rounded-full bg-blue-50 px-3 py-1 text-base font-medium text-blue-700">
+            Sales timeline is required when a sales file is uploaded
+          </span>
         </div>
-        <button
-          onClick={() => {
-            if (files.zfsSales && timeline === "none") {
-              setError("Please select a timeline for the sales file");
-              return;
-            }
-            processFiles(timeline);
-          }}
-          disabled={isProcessing || (files.zfsSales && timeline === "none")}
-          className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-semibold text-white bg-black rounded-lg hover:bg-gray-800 transition-all duration-200 shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-black disabled:hover:shadow-md"
-        >
-          Process Files
-        </button>
-      </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 px-5 py-4">
+          <div className="max-w-3xl text-base text-slate-600">
+            Upload at least one ZFS file. Add a sales timeline before processing a ZFS Sales file.
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={resetFiles}
+              className="ops-button-secondary"
+            >
+              <RotateCcw className="w-4 h-4" />
+              Reset Files
+            </button>
+            <button
+              type="button"
+              onClick={onOpenBlacklist}
+              className="ops-button-secondary"
+            >
+              Manage Blacklist
+              {blacklistCount > 0 && (
+                <span className="inline-flex min-w-[20px] items-center justify-center rounded-[999px] bg-slate-950 px-2 py-0.5 text-sm font-semibold text-white">
+                  {blacklistCount}
+                </span>
+              )}
+            </button>
+            {showTabs && (
+              <button
+                type="button"
+                onClick={clearTables}
+                className="ops-button-danger"
+              >
+                Clear Tables
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (!hasAnyZfsInput) {
+                  setError("Please upload at least one ZFS file before processing");
+                  return;
+                }
+                if (files.zfsSales && timeline === "none") {
+                  setError("Please select a timeline for the sales file");
+                  return;
+                }
+                processFiles(timeline);
+              }}
+              disabled={isProcessDisabled}
+              title={
+                !hasAnyZfsInput
+                  ? "Upload at least one file before processing"
+                  : isTimelineMissing
+                    ? "Select a timeline for the ZFS Sales file"
+                    : "Process uploaded ZFS files"
+              }
+              className="ops-button-primary px-6"
+            >
+              {processButtonLabel}
+            </button>
+          </div>
+        </div>
+      </section>
 
       <div ref={tabsRef} id="results-section">
         {showTabs && (
@@ -172,10 +275,10 @@ interface FBAContentProps {
   onOpenBlacklist: () => void;
 }
 
-const FBAContent: React.FC<FBAContentProps> = ({ 
-  fbaFiles, 
-  setFbaFiles, 
-  fbaData, 
+const FBAContent: React.FC<FBAContentProps> = ({
+  fbaFiles,
+  setFbaFiles,
+  fbaData,
   setFbaData,
   resetFiles,
   clearTables,
@@ -191,38 +294,13 @@ const FBAContent: React.FC<FBAContentProps> = ({
     fbaData.sellerboardStock.filter((item) => !blacklistSet.has((item.SKU || '').trim().toUpperCase()))
   ), [fbaData.sellerboardStock, blacklistSet]);
 
-  // Load saved files and data from IndexedDB on component mount
-  useEffect(() => {
-    const loadSavedData = async () => {
-      try {
-        // Load saved files - specify 'fba' as the storeType
-        const savedFiles = await getFiles('fba');
-        if (savedFiles) {
-          setFbaFiles({
-            sellerboardExport: savedFiles.sellerboardExport,
-            sellerboardReturns: savedFiles.sellerboardReturns,
-          });
-        }
-
-        // Load saved parsed data - specify 'fba' as the storeType
-        const savedData = await getStoredData('fba');
-        if (savedData?.parsedData) {
-          if (savedData.parsedData.sellerboardStock?.length > 0) {
-            setFbaData({
-              sellerboardStock: savedData.parsedData.sellerboardStock,
-            });
-          }
-        }
-      } catch (err) {
-        console.error("Error loading saved data:", err);
-      }
-    };
-
-    loadSavedData();
-  }, [setFbaFiles, setFbaData]);
-
-  // Update showTabs when fbaData changes
-  const showTabs = filteredSellerboardStock.length > 0;
+  const hasResults = filteredSellerboardStock.length > 0;
+  const isProcessDisabled = isProcessing || !fbaFiles.sellerboardExport;
+  const processButtonLabel = isProcessing
+    ? "Processing..."
+    : !fbaFiles.sellerboardExport
+      ? "Upload Sellerboard Export"
+      : "Process Files";
 
   const handleFileChange = async (
     event: React.ChangeEvent<HTMLInputElement>,
@@ -230,12 +308,12 @@ const FBAContent: React.FC<FBAContentProps> = ({
   ) => {
     const newFiles = event.target.files;
     if (!newFiles) return;
-    
+
     const updatedFiles = {
       ...fbaFiles,
       [type]: newFiles[0],
     };
-    
+
     setFbaFiles(updatedFiles);
 
     // Store in IndexedDB
@@ -302,7 +380,7 @@ const FBAContent: React.FC<FBAContentProps> = ({
         const sellerboardData = await parseFile(fbaFiles.sellerboardExport, (progress) => {
           setProcessingStatus(`Processing Sellerboard export (${Math.round(progress)}%)...`);
         });
-        
+
         // Process Sellerboard Sales + Returns if available
         let salesReturnsData = null;
         if (fbaFiles.sellerboardReturns) {
@@ -310,30 +388,7 @@ const FBAContent: React.FC<FBAContentProps> = ({
           salesReturnsData = await parseFile(fbaFiles.sellerboardReturns, (progress) => {
             setProcessingStatus(`Processing Sellerboard Sales + Returns (${Math.round(progress)}%)...`);
           });
-          
-          // Log sellerboard returns data for debugging
-          console.log("Parsed sellerboard returns data:", salesReturnsData);
-          
-          // Log specific fields for debugging sales and returns values
-          if (salesReturnsData && salesReturnsData.length > 0) {
-            // Find an entry with SKU for better logging
-            const sampleItem = salesReturnsData.find(item => item.SKU) || salesReturnsData[0];
-            console.log("Sample returns data fields:", {
-              SKU: sampleItem.SKU,
-              // Sales fields
-              Totals: sampleItem.Totals,
-              EMPTY_22: sampleItem.__EMPTY_22,
-              undefined_22: sampleItem.undefined_22,
-              // Keys that might contain sales data
-              allKeys: Object.keys(sampleItem).filter(key => 
-                key.includes('22') || key.includes('Totals') || key.includes('Sales')
-              ),
-              // Return rate fields
-              EMPTY_24: sampleItem.__EMPTY_24,
-              undefined_24: sampleItem.undefined_24,
-              PercentRefunds: sampleItem["% Refunds"]
-            });
-          }
+
         }
 
         const normalizeSkuValue = (value: any) =>
@@ -350,26 +405,21 @@ const FBAContent: React.FC<FBAContentProps> = ({
               return !blacklistSet.has(sku);
             })
           : null;
-        
-        // Get coverage days from IndexedDB or use default
-        let coverageDays = 14; // Default value
-        try {
-          const savedData = await getStoredData('fba');
-          if (savedData?.coverageDays) {
-            coverageDays = savedData.coverageDays;
-          }
-        } catch (err) {
-          console.error("Error loading coverage days:", err);
-        }
-        
-        const processedSellerboardData = processSellerboardStock(filteredSellerboardData, filteredSalesReturnsData, coverageDays)
+
+        const {
+          coverageDays,
+          safetyFactor,
+          trendFactor,
+        } = await loadFbaSettings();
+
+        const processedSellerboardData = processSellerboardStock(filteredSellerboardData, filteredSalesReturnsData, coverageDays, safetyFactor, trendFactor)
           .filter((item) => !blacklistSet.has((item.SKU || '').trim().toUpperCase()));
-        
+
         // Update local state
         setFbaData({
           sellerboardStock: processedSellerboardData,
         });
-        
+
         // Store in IndexedDB with 'fba' storeType
         try {
           // Create a ParsedData object
@@ -383,18 +433,17 @@ const FBAContent: React.FC<FBAContentProps> = ({
             integrated: [],
             sellerboardStock: processedSellerboardData,
           };
-          
-          await storeData({ 
-            parsedData: parsedDataObj, 
-            recommendations: [],
-            coverageDays: coverageDays, // Save coverage days with the stored data
+
+          await saveFbaProcessedData({
+            parsedData: parsedDataObj,
+            coverageDays,
             rawReturnsData: filteredSalesReturnsData,
             blacklist: Array.from(blacklistSet)
-          }, 'fba'); // Pass 'fba' as storeType
+          });
         } catch (err) {
           console.error("Error storing parsed data:", err);
         }
-        
+
         // Scroll to results after processing
         setTimeout(() => {
           tabsRef.current?.scrollIntoView({
@@ -413,103 +462,100 @@ const FBAContent: React.FC<FBAContentProps> = ({
     }
   };
 
-  const tabs = [
-    {
-      id: "stock",
-      label: "FBA Stock Overview & Recommendation",
-      content:
-        filteredSellerboardStock.length > 0 ? (
-          <FBAStockTable data={filteredSellerboardStock} />
-        ) : null,
-    },
-    // Add more tabs here in the future like recommendations if needed
-  ];
-
   return (
     <>
       <LoadingOverlay isLoading={isProcessing} message={processingStatus} />
-      <div className="space-y-4">
+      <div className="space-y-5">
         {error && (
-          <div className="bg-red-50 p-4 rounded-md border border-red-100">
-            <div className="flex">
-              <div className="flex-shrink-0">
-                <svg
-                  className="h-5 w-5 text-red-400"
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                  aria-hidden="true"
-                >
-                  <path
-                    fillRule="evenodd"
-                    d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
-                    clipRule="evenodd"
-                  />
-                </svg>
-              </div>
-              <div className="ml-3">
-                <h3 className="text-sm font-medium text-red-800">Error</h3>
-                <div className="mt-2 text-sm text-red-700">{error}</div>
-              </div>
-            </div>
-          </div>
+          <Alert variant="destructive">
+            <AlertTitle>{error}</AlertTitle>
+          </Alert>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <FileUploadSection
-            title="Sellerboard Export"
-            onChange={(e) => handleFileChange(e, "sellerboardExport")}
-            onRemove={(name) => handleRemoveFile(name, "sellerboardExport")}
-            files={fbaFiles.sellerboardExport ? [fbaFiles.sellerboardExport] : []}
-            acceptedFileTypes=".csv,.tsv,.txt,.xlsx,.xls"
-          />
-          <FileUploadSection
-            title="Sellerboard Sales + Returns"
-            onChange={(e) => handleFileChange(e, "sellerboardReturns")}
-            onRemove={(name) => handleRemoveFile(name, "sellerboardReturns")}
-            files={fbaFiles.sellerboardReturns ? [fbaFiles.sellerboardReturns] : []}
-            acceptedFileTypes=".csv,.tsv,.txt,.xlsx,.xls"
-          />
-        </div>
-        <div className="flex justify-between items-center">
-          <div className="flex gap-3">
-            <button
-              onClick={resetFiles}
-              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-gray-700 bg-white border-2 border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-all duration-200"
-            >
-              <RotateCcw className="w-4 h-4" />
-              Reset Files
-            </button>
-            <button
-              onClick={onOpenBlacklist}
-              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-gray-700 bg-white border-2 border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-all duration-200"
-            >
-              Manage Blacklist
-              {blacklist.length > 0 && (
-                <span className="inline-flex items-center justify-center rounded-full bg-black px-2 py-0.5 text-xs font-semibold text-white min-w-[20px]">
-                  {blacklist.length}
-                </span>
-              )}
-            </button>
-            {showTabs && (
-              <button
-                onClick={clearTables}
-                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-red-700 bg-white border-2 border-red-200 rounded-lg hover:bg-red-50 hover:border-red-300 transition-all duration-200"
-              >
-                Clear Tables
-              </button>
-            )}
+        <section className="ops-surface rounded-[8px] p-5">
+          <div className="grid gap-4 md:grid-cols-2">
+            <FileUploadSection
+              title="Sellerboard Export"
+              onChange={(e) => handleFileChange(e, "sellerboardExport")}
+              onRemove={(name) => handleRemoveFile(name, "sellerboardExport")}
+              files={fbaFiles.sellerboardExport ? [fbaFiles.sellerboardExport] : []}
+              acceptedFileTypes=".csv,.tsv,.txt,.xlsx,.xls"
+            />
+            <FileUploadSection
+              title="Sellerboard Sales + Returns"
+              onChange={(e) => handleFileChange(e, "sellerboardReturns")}
+              onRemove={(name) => handleRemoveFile(name, "sellerboardReturns")}
+              files={fbaFiles.sellerboardReturns ? [fbaFiles.sellerboardReturns] : []}
+              acceptedFileTypes=".csv,.tsv,.txt,.xlsx,.xls"
+            />
           </div>
-          <button
-            onClick={() => processFiles()}
-            className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-semibold text-white bg-black rounded-lg hover:bg-gray-800 transition-all duration-200 shadow-md hover:shadow-lg"
-          >
-            Process Files
-          </button>
-        </div>
+        </section>
+
+        <section className="ops-surface rounded-[8px]">
+          <div className="ops-section-header flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h3 className="ops-title">FBA Operations</h3>
+              <p className="ops-muted">Create stock recommendations from the Sellerboard export.</p>
+            </div>
+            <span className="rounded-full bg-blue-50 px-3 py-1 text-base font-medium text-blue-700">
+              Sales and returns file is optional
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 px-5 py-4">
+            <div className="max-w-3xl text-base text-slate-600">
+              Upload the Sellerboard Export to calculate recommendations. Add Sales + Returns for return-rate adjustments.
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={resetFiles}
+                className="ops-button-secondary"
+              >
+                <RotateCcw className="w-4 h-4" />
+                Reset Files
+              </button>
+              <button
+                type="button"
+                onClick={onOpenBlacklist}
+                className="ops-button-secondary"
+              >
+                Manage Blacklist
+                {blacklist.length > 0 && (
+                  <span className="inline-flex min-w-[20px] items-center justify-center rounded-[999px] bg-slate-950 px-2 py-0.5 text-sm font-semibold text-white">
+                    {blacklist.length}
+                  </span>
+                )}
+              </button>
+              {hasResults && (
+                <button
+                  type="button"
+                  onClick={clearTables}
+                  className="ops-button-danger"
+                >
+                  Clear Tables
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  if (!fbaFiles.sellerboardExport) {
+                    setError("Please upload a Sellerboard Export before processing");
+                    return;
+                  }
+                  processFiles();
+                }}
+                disabled={isProcessDisabled}
+                className="ops-button-primary px-6"
+              >
+                {processButtonLabel}
+              </button>
+            </div>
+          </div>
+        </section>
 
         <div ref={tabsRef} id="fba-results-section">
-          {showTabs && <Tabs tabs={tabs} id="fba-tabs" />}
+          {hasResults && <FBAStockTable data={filteredSellerboardStock} />}
         </div>
       </div>
     </>
@@ -540,7 +586,10 @@ function useScrollToResults() {
 // Define keys for persistence
 const RELATIVE_STOCK_FILE_KEY = 'relativeStockFile';
 const RELATIVE_STOCK_TABLE_KEY = 'relativeStockTable';
-const SHOPIFY_SYNC_META_KEY = 'shopifySyncMeta';
+const LEGACY_SHOPIFY_SYNC_META_KEY = 'shopifySyncMeta';
+const ZFS_SHOPIFY_SYNC_META_KEY = 'zfsShopifySyncMeta';
+const RETAGGING_SHOPIFY_SYNC_META_KEY = 'retaggingShopifySyncMeta';
+const STOCK_RETURN_SHOPIFY_SYNC_META_KEY = 'stockReturnShopifySyncMeta';
 
 type ShopifySyncMeta = {
   lastSyncedAt: string;
@@ -548,6 +597,92 @@ type ShopifySyncMeta = {
   mapperCount: number;
   locationName: string;
 };
+
+type ShopifySyncModule = 'zfs' | 'retagging' | 'stock-return' | 'barcodes';
+
+const shopifySyncModuleLabels: Record<ShopifySyncModule, string> = {
+  zfs: 'ZFS',
+  retagging: 'Retagging',
+  'stock-return': 'Stock Return',
+  barcodes: 'Barcode PDFs',
+};
+
+const barcodeBrandLabels: Record<BarcodeBrand, string> = {
+  blackskies: 'Blackskies',
+  akitsune: 'Akitsune',
+};
+
+const readShopifySyncMeta = (...keys: string[]): ShopifySyncMeta | null => {
+  for (const key of keys) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) return JSON.parse(raw) as ShopifySyncMeta;
+    } catch {
+      /* ignore malformed persisted metadata */
+    }
+  }
+  return null;
+};
+
+const toolLinks = [
+  {
+    to: '/zfs',
+    title: 'ZFS',
+    description: 'Build Zalando stock overviews and replenishment recommendations.',
+  },
+  {
+    to: '/fba',
+    title: 'FBA',
+    description: 'Build Amazon FBA stock and replenishment recommendations.',
+  },
+  {
+    to: '/retagging',
+    title: 'Retagging',
+    description: 'Review Zalando season retagging decisions and operational notes.',
+  },
+  {
+    to: '/sale-prices',
+    title: 'Sale Prices',
+    description: 'Preview and approve Zalando sale-price updates in Shopify.',
+  },
+  {
+    to: '/stock-return',
+    title: 'Stock Return',
+    description: 'Find ZFS overstock and prepare return recommendations.',
+  },
+  {
+    to: '/barcodes',
+    title: 'Barcode PDFs',
+    description: 'Create printable EAN barcode labels from CSV or Shopify product data.',
+  },
+] as const;
+
+const ToolHome = () => (
+  <section className="mx-auto max-w-6xl space-y-5">
+    <div>
+      <h1 className="text-2xl font-semibold text-slate-950">Inventory Tools</h1>
+      <p className="mt-1 text-base text-slate-500">Choose a workflow to get started.</p>
+    </div>
+
+    <nav className="grid gap-4 md:grid-cols-2 xl:grid-cols-3" aria-label="Inventory tools">
+      {toolLinks.map((tool) => (
+        <NavLink
+          key={tool.to}
+          to={tool.to}
+          className="ops-surface group flex min-h-40 flex-col justify-between p-6 transition hover:border-slate-400 hover:shadow-md"
+        >
+          <div>
+            <h2 className="text-xl font-semibold text-slate-950">{tool.title}</h2>
+            <p className="mt-2 text-base leading-6 text-slate-500">{tool.description}</p>
+          </div>
+          <span className="mt-6 text-base font-semibold text-slate-900 group-hover:text-emerald-700">
+            Open tool
+          </span>
+        </NavLink>
+      ))}
+    </nav>
+  </section>
+);
 
 function timeAgo(timestamp: string): string {
   const ms = Date.now() - new Date(timestamp).getTime();
@@ -562,27 +697,42 @@ function timeAgo(timestamp: string): string {
 }
 
 const IntegratedStockParser: React.FC = () => {
+  const authenticatedFetch = useAuthenticatedFetch();
   const location = useLocation();
-  const onZfsRoute = location.pathname === '/zfs' || location.pathname === '/';
+  const onHomeRoute = location.pathname === '/';
+  const onZfsRoute = location.pathname === '/zfs';
+  const onRetaggingRoute = location.pathname === '/retagging';
+  const onStockReturnRoute = location.pathname === '/stock-return';
+  const onBarcodesRoute = location.pathname === '/barcodes';
+  const canSyncShopify = onZfsRoute || onRetaggingRoute || onStockReturnRoute;
+  const currentShopifySyncModule: ShopifySyncModule | null = onBarcodesRoute
+    ? 'barcodes'
+    : onStockReturnRoute
+    ? 'stock-return'
+    : onRetaggingRoute
+      ? 'retagging'
+      : onZfsRoute
+        ? 'zfs'
+        : null;
   const { tabsRef, setShouldScroll, setHasProcessed } = useScrollToResults();
   const [showZfsBlacklistModal, setShowZfsBlacklistModal] = useState(false);
   const [showFbaBlacklistModal, setShowFbaBlacklistModal] = useState(false);
-  
+
   // Add state for export overlay
   const [showExportOverlay, setShowExportOverlay] = useState(false);
   const [exportFile, setExportFile] = useState<File | null>(null);
   // State for overlay content
   const [relativeStockData, setRelativeStockData] = useState<{
      articleNumber: string;
-     warehouse?: string; 
-     binLocation?: string; 
-     isDefaultBinLocation?: boolean; 
-     physicalStock: number; 
+     warehouse?: string;
+     binLocation?: string;
+     isDefaultBinLocation?: boolean;
+     physicalStock: number;
   }[]>([]);
   const [processingExport, setProcessingExport] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [isLoadingPersistedData, setIsLoadingPersistedData] = useState(true); // Loading state
-  
+
   // Add state for FBA tab
   const [fbaFiles, setFbaFiles] = useState<{
     sellerboardExport: File | null;
@@ -591,12 +741,31 @@ const IntegratedStockParser: React.FC = () => {
     sellerboardExport: null,
     sellerboardReturns: null,
   });
-  
+
   const [fbaData, setFbaData] = useState<{
     sellerboardStock: ProcessedSellerboardStock[];
   }>({
     sellerboardStock: [],
   });
+  const [retaggingShopifyStockFile, setRetaggingShopifyStockFile] = useState<File | null>(null);
+  const [retaggingShopifySkuEanFile, setRetaggingShopifySkuEanFile] = useState<File | null>(null);
+  const [isRetaggingShopifyStockLoading, setIsRetaggingShopifyStockLoading] = useState(true);
+  const [retaggingShopifySyncError, setRetaggingShopifySyncError] = useState<string | null>(null);
+  const [stockReturnShopifyStockFile, setStockReturnShopifyStockFile] = useState<File | null>(null);
+  const [stockReturnShopifySkuEanFile, setStockReturnShopifySkuEanFile] = useState<File | null>(null);
+  const [isStockReturnShopifyStockLoading, setIsStockReturnShopifyStockLoading] = useState(true);
+  const [stockReturnShopifySyncError, setStockReturnShopifySyncError] = useState<string | null>(null);
+  const [barcodeShopifyResult, setBarcodeShopifyResult] = useState<BarcodeCsvResult | null>(null);
+  const [barcodeShopifyBrand, setBarcodeShopifyBrand] = useState<BarcodeBrand | null>(null);
+  const [barcodeShopifySyncedAt, setBarcodeShopifySyncedAt] = useState<string | null>(null);
+  const [isBarcodeShopifyStateLoading, setIsBarcodeShopifyStateLoading] = useState(true);
+  const [barcodeShopifySyncError, setBarcodeShopifySyncError] = useState<string | null>(null);
+  const [barcodeCsvSourceActive, setBarcodeCsvSourceActive] = useState(false);
+  const barcodeCsvSourceActiveRef = useRef(false);
+  const handleBarcodeCsvSourceActiveChange = useCallback((active: boolean) => {
+    barcodeCsvSourceActiveRef.current = active;
+    setBarcodeCsvSourceActive(active);
+  }, []);
   const [fbaBlacklist, setFbaBlacklist] = useState<string[]>([]);
   const fbaBlacklistRef = useRef<string[]>([]);
   useEffect(() => {
@@ -635,32 +804,192 @@ const IntegratedStockParser: React.FC = () => {
     processingStatus,
     handleFileChange,
     handleRemoveFile,
-    setFile,
+    setFilesPatch,
     processFiles,
     setTimeline,
     resetFiles,
     clearTables,
     setError,
+    filesLoaded,
     blacklist: zfsBlacklist,
     addToBlacklist: addZfsToBlacklist,
     removeFromBlacklist: removeZfsFromBlacklist,
   } = useFileProcessing();
 
-  const [isShopifySyncing, setIsShopifySyncing] = useState(false);
-  const [shopifySyncMeta, setShopifySyncMeta] = useState<ShopifySyncMeta | null>(() => {
-    try {
-      const raw = localStorage.getItem(SHOPIFY_SYNC_META_KEY);
-      return raw ? (JSON.parse(raw) as ShopifySyncMeta) : null;
-    } catch {
-      return null;
-    }
-  });
+  const [zfsRecommendationSettingsLoaded, setZfsRecommendationSettingsLoaded] = useState(false);
+  const [zfsCoverageDays, setZfsCoverageDays] = useState(14);
+  const [zfsSafetyFactor, setZfsSafetyFactor] = useState(0);
+  const [zfsTrendFactor, setZfsTrendFactor] = useState(0);
 
-  const handleShopifySync = async () => {
-    setIsShopifySyncing(true);
-    setError(null);
+  const [syncingShopifyModule, setSyncingShopifyModule] = useState<ShopifySyncModule | null>(null);
+  const [syncingBarcodeBrand, setSyncingBarcodeBrand] = useState<BarcodeBrand | null>(null);
+  const isShopifySyncing = syncingShopifyModule !== null;
+  const [zfsShopifySyncMeta, setZfsShopifySyncMeta] = useState<ShopifySyncMeta | null>(() =>
+    readShopifySyncMeta(ZFS_SHOPIFY_SYNC_META_KEY, LEGACY_SHOPIFY_SYNC_META_KEY)
+  );
+  const [retaggingShopifySyncMeta, setRetaggingShopifySyncMeta] = useState<ShopifySyncMeta | null>(() =>
+    readShopifySyncMeta(RETAGGING_SHOPIFY_SYNC_META_KEY)
+  );
+  const [stockReturnShopifySyncMeta, setStockReturnShopifySyncMeta] = useState<ShopifySyncMeta | null>(() =>
+    readShopifySyncMeta(STOCK_RETURN_SHOPIFY_SYNC_META_KEY)
+  );
+  const activeStockShopifySyncMeta = onStockReturnRoute
+    ? stockReturnShopifySyncMeta
+    : onRetaggingRoute
+      ? retaggingShopifySyncMeta
+      : onZfsRoute
+        ? zfsShopifySyncMeta
+        : null;
+  const shopifySyncStatusModule = syncingShopifyModule ?? currentShopifySyncModule;
+  const shopifySyncStatusLabel = shopifySyncStatusModule === 'barcodes'
+    ? syncingBarcodeBrand
+      ? `Fetching ${barcodeBrandLabels[syncingBarcodeBrand]} barcode products`
+      : 'Fetching Shopify barcode products'
+    : shopifySyncStatusModule
+      ? `Fetching Shopify stock for ${shopifySyncModuleLabels[shopifySyncStatusModule]}`
+      : 'Fetching Shopify stock';
+  const shopifySyncStatusText = isShopifySyncing
+    ? shopifySyncStatusLabel
+    : currentShopifySyncModule === 'barcodes'
+      ? barcodeCsvSourceActive
+        ? 'CSV source active · reset files to sync Shopify'
+        : barcodeShopifySyncedAt && barcodeShopifyResult
+          ? `${barcodeShopifyBrand ? `${barcodeBrandLabels[barcodeShopifyBrand]} · ` : ''}Last synced ${timeAgo(barcodeShopifySyncedAt)} · ${barcodeShopifyResult.summary.readyRows.toLocaleString()} labels ready`
+          : 'Not synced yet'
+      : activeStockShopifySyncMeta
+        ? `Last synced ${timeAgo(activeStockShopifySyncMeta.lastSyncedAt)} · ${activeStockShopifySyncMeta.internalCount.toLocaleString()} stock rows`
+        : 'Not synced yet';
+  const shopifySyncDisabled =
+    isShopifySyncing ||
+    (currentShopifySyncModule === 'barcodes' && barcodeCsvSourceActive);
+
+  const clearZfsShopifySyncMeta = () => {
+    setZfsShopifySyncMeta(null);
+    localStorage.removeItem(ZFS_SHOPIFY_SYNC_META_KEY);
+    localStorage.removeItem(LEGACY_SHOPIFY_SYNC_META_KEY);
+  };
+
+  const clearRetaggingShopifySyncMeta = () => {
+    setRetaggingShopifySyncMeta(null);
+    localStorage.removeItem(RETAGGING_SHOPIFY_SYNC_META_KEY);
+  };
+
+  const clearStockReturnShopifySyncMeta = () => {
+    setStockReturnShopifySyncMeta(null);
+    localStorage.removeItem(STOCK_RETURN_SHOPIFY_SYNC_META_KEY);
+  };
+
+  const clearBarcodeShopifyData = useCallback(async () => {
+    setBarcodeShopifyResult(null);
+    setBarcodeShopifyBrand(null);
+    setBarcodeShopifySyncedAt(null);
+    setBarcodeShopifySyncError(null);
     try {
-      const res = await fetch('/api/shopify/sync');
+      await clearBarcodeShopifyState();
+    } catch (err) {
+      console.error('Could not clear saved Shopify barcode data:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadBarcodeShopifyState()
+      .then((persisted) => {
+        if (cancelled || !persisted || barcodeCsvSourceActiveRef.current) return;
+        setBarcodeShopifyResult(persisted.result);
+        setBarcodeShopifyBrand(persisted.brand);
+        setBarcodeShopifySyncedAt(persisted.syncedAt);
+      })
+      .catch((err) => {
+        console.error('Could not load saved Shopify barcode data:', err);
+      })
+      .finally(() => {
+        if (!cancelled) setIsBarcodeShopifyStateLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!filesLoaded || !zfsShopifySyncMeta) return;
+    if (!files.internal || !files.skuEanMapper) {
+      clearZfsShopifySyncMeta();
+    }
+  }, [files.internal, files.skuEanMapper, filesLoaded, zfsShopifySyncMeta]);
+
+  const handleShopifySync = async (barcodeBrand?: BarcodeBrand) => {
+    if (!currentShopifySyncModule) return;
+
+    const syncTarget = currentShopifySyncModule;
+    if (syncTarget === 'barcodes' && (!barcodeBrand || barcodeCsvSourceActive)) return;
+
+    setSyncingShopifyModule(syncTarget);
+    setSyncingBarcodeBrand(syncTarget === 'barcodes' ? barcodeBrand ?? null : null);
+    if (syncTarget === 'barcodes') {
+      await clearBarcodeShopifyData();
+    } else if (syncTarget === 'stock-return') {
+      setStockReturnShopifySyncError(null);
+    } else if (syncTarget === 'retagging') {
+      setRetaggingShopifySyncError(null);
+    } else {
+      setError(null);
+    }
+    try {
+      if (syncTarget === 'barcodes') {
+        const requestedBrand = barcodeBrand!;
+        const response = await authenticatedFetch(`/api/shopify/barcodes?brand=${requestedBrand}`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+        });
+        const raw = await response.text();
+        let body: ShopifyBarcodeApiResponse | ShopifyBarcodeApiError;
+
+        try {
+          body = JSON.parse(raw) as ShopifyBarcodeApiResponse | ShopifyBarcodeApiError;
+        } catch {
+          throw new Error(
+            'The Shopify API is unavailable. Run the app with Vercel development mode instead of the frontend-only Vite server.'
+          );
+        }
+
+        if (!response.ok) {
+          const apiError = body as ShopifyBarcodeApiError;
+          throw new Error(
+            apiError.message || apiError.error || `Shopify sync failed (${response.status})`
+          );
+        }
+        if (!Array.isArray((body as ShopifyBarcodeApiResponse).rows)) {
+          throw new Error('Shopify returned an invalid barcode product response.');
+        }
+
+        const barcodeResponse = body as ShopifyBarcodeApiResponse;
+        if (barcodeResponse.brand !== requestedBrand) {
+          throw new Error('Shopify returned barcode products for the wrong brand.');
+        }
+        const processedResult = processShopifyBarcodeRows(barcodeResponse.rows);
+        const syncedAt = typeof barcodeResponse.syncedAt === 'string'
+          ? barcodeResponse.syncedAt
+          : new Date().toISOString();
+        setBarcodeShopifyResult(processedResult);
+        setBarcodeShopifyBrand(requestedBrand);
+        setBarcodeShopifySyncedAt(syncedAt);
+        try {
+          await saveBarcodeShopifyState({
+            result: processedResult,
+            brand: requestedBrand,
+            syncedAt,
+          });
+        } catch (err) {
+          console.error('Could not save Shopify barcode data:', err);
+        }
+        return;
+      }
+
+      const res = await authenticatedFetch('/api/shopify/sync');
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}));
         throw new Error(errBody.error || `Sync failed (${res.status})`);
@@ -691,25 +1020,62 @@ const IntegratedStockParser: React.FC = () => {
       const internalFile = new File([internalCsv], 'shopify-internal-stocks.csv', { type: 'text/csv' });
       const mapperFile = new File([mapperCsv], 'shopify-sku-ean.csv', { type: 'text/csv' });
 
-      setFile('internal', internalFile);
-      setFile('skuEanMapper', mapperFile);
-
       const meta: ShopifySyncMeta = {
         lastSyncedAt: typeof data.syncedAt === 'string' ? data.syncedAt : new Date().toISOString(),
         internalCount: data.counts?.internal ?? (Array.isArray(data.internal) ? data.internal.length : 0),
         mapperCount: data.counts?.skuEanMapper ?? (Array.isArray(data.skuEanMapper) ? data.skuEanMapper.length : 0),
         locationName: typeof data.locationName === 'string' ? data.locationName : 'Lager',
       };
-      setShopifySyncMeta(meta);
-      try {
-        localStorage.setItem(SHOPIFY_SYNC_META_KEY, JSON.stringify(meta));
-      } catch {
-        /* ignore quota errors */
+
+      if (syncTarget === 'stock-return') {
+        setStockReturnShopifyStockFile(internalFile);
+        setStockReturnShopifySkuEanFile(mapperFile);
+        await saveStockReturnShopifyStockFile(internalFile);
+        await saveStockReturnShopifySkuEanFile(mapperFile);
+        await clearStockReturnResult();
+        setStockReturnShopifySyncMeta(meta);
+        try {
+          localStorage.setItem(STOCK_RETURN_SHOPIFY_SYNC_META_KEY, JSON.stringify(meta));
+        } catch {
+          /* ignore quota errors */
+        }
+      } else if (syncTarget === 'retagging') {
+        setRetaggingShopifyStockFile(internalFile);
+        setRetaggingShopifySkuEanFile(mapperFile);
+        await saveRetaggingShopifyStockFile(internalFile);
+        await saveRetaggingShopifySkuEanFile(mapperFile);
+        await clearRetaggingResult();
+        setRetaggingShopifySyncMeta(meta);
+        try {
+          localStorage.setItem(RETAGGING_SHOPIFY_SYNC_META_KEY, JSON.stringify(meta));
+        } catch {
+          /* ignore quota errors */
+        }
+      } else {
+        setFilesPatch({
+          internal: internalFile,
+          skuEanMapper: mapperFile,
+        });
+        setZfsShopifySyncMeta(meta);
+        try {
+          localStorage.setItem(ZFS_SHOPIFY_SYNC_META_KEY, JSON.stringify(meta));
+        } catch {
+          /* ignore quota errors */
+        }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Shopify sync failed');
+      if (syncTarget === 'barcodes') {
+        setBarcodeShopifySyncError(err instanceof Error ? err.message : 'Shopify sync failed');
+      } else if (syncTarget === 'stock-return') {
+        setStockReturnShopifySyncError(err instanceof Error ? err.message : 'Shopify sync failed');
+      } else if (syncTarget === 'retagging') {
+        setRetaggingShopifySyncError(err instanceof Error ? err.message : 'Shopify sync failed');
+      } else {
+        setError(err instanceof Error ? err.message : 'Shopify sync failed');
+      }
     } finally {
-      setIsShopifySyncing(false);
+      setSyncingShopifyModule(null);
+      setSyncingBarcodeBrand(null);
     }
   };
 
@@ -754,6 +1120,99 @@ const IntegratedStockParser: React.FC = () => {
     [recommendations, zfsBlacklistSet]
   );
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadZfsRecommendationSettings = async () => {
+      try {
+        const settings = await loadZfsSettings();
+        if (!cancelled) {
+          setZfsCoverageDays(settings.coverageDays);
+          setZfsSafetyFactor(settings.safetyFactor);
+          setZfsTrendFactor(settings.trendFactor);
+        }
+      } catch (err) {
+        console.error("Error loading ZFS recommendation settings:", err);
+      } finally {
+        if (!cancelled) {
+          setZfsRecommendationSettingsLoaded(true);
+        }
+      }
+    };
+
+    loadZfsRecommendationSettings();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (zfsRecommendationSettingsLoaded) {
+      saveZfsSafetyFactor(zfsSafetyFactor);
+    }
+  }, [zfsSafetyFactor, zfsRecommendationSettingsLoaded]);
+
+  useEffect(() => {
+    if (zfsRecommendationSettingsLoaded) {
+      saveZfsTrendFactor(zfsTrendFactor);
+    }
+  }, [zfsTrendFactor, zfsRecommendationSettingsLoaded]);
+
+  const persistZfsCoverageDays = useCallback(async (days: number) => {
+    try {
+      await saveZfsCoverageDays(days);
+    } catch (err) {
+      console.error("Error saving ZFS coverage days:", err);
+    }
+  }, []);
+
+  const handleZfsCoverageDaysChange = useCallback((days: number) => {
+    setZfsCoverageDays(days);
+    void persistZfsCoverageDays(days);
+  }, [persistZfsCoverageDays]);
+
+  const handleZfsSafetyFactorChange = useCallback((value: number) => {
+    setZfsSafetyFactor(value);
+  }, []);
+
+  const handleZfsTrendFactorChange = useCallback((value: number) => {
+    setZfsTrendFactor(value);
+  }, []);
+
+  const zfsRecommendationsForDisplay = useMemo<ArticleRecommendation[]>(() => {
+    if (!zfsRecommendationSettingsLoaded || filteredRecommendations.length === 0) {
+      return [];
+    }
+
+    if (timeline === 'none') {
+      return filteredRecommendations;
+    }
+
+    try {
+      return calculateStockRecommendations(
+        filteredParsedData.zfsSales,
+        filteredParsedData.integrated,
+        Math.max(Number(zfsCoverageDays), 1),
+        timeline,
+        zfsSafetyFactor,
+        zfsTrendFactor
+      );
+    } catch (err) {
+      console.error("Error recalculating ZFS recommendations:", err);
+      return filteredRecommendations;
+    }
+  }, [
+    zfsRecommendationSettingsLoaded,
+    filteredRecommendations,
+    filteredParsedData.zfsSales,
+    filteredParsedData.integrated,
+    timeline,
+    zfsCoverageDays,
+    zfsSafetyFactor,
+    zfsTrendFactor,
+  ]);
+
   const showTabs =
     filteredParsedData.integrated.length > 0 || filteredRecommendations.length > 0;
 
@@ -796,6 +1255,172 @@ const IntegratedStockParser: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    const loadRetaggingShopifyStock = async () => {
+      try {
+        const savedRetaggingState = await loadRetaggingState();
+        if (!cancelled) {
+          setRetaggingShopifyStockFile(savedRetaggingState.shopifyStockFile);
+          setRetaggingShopifySkuEanFile(savedRetaggingState.shopifySkuEanFile);
+          if (retaggingShopifySyncMeta && (!savedRetaggingState.shopifyStockFile || !savedRetaggingState.shopifySkuEanFile)) {
+            clearRetaggingShopifySyncMeta();
+          }
+        }
+      } catch (err) {
+        console.error("Error loading Retagging Shopify stock file:", err);
+      } finally {
+        if (!cancelled) {
+          setIsRetaggingShopifyStockLoading(false);
+        }
+      }
+    };
+
+    loadRetaggingShopifyStock();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [retaggingShopifySyncMeta]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadStockReturnShopifyStock = async () => {
+      try {
+        const savedStockReturnState = await loadStockReturnState();
+        if (!cancelled) {
+          setStockReturnShopifyStockFile(savedStockReturnState.shopifyStockFile);
+          setStockReturnShopifySkuEanFile(savedStockReturnState.shopifySkuEanFile);
+          if (stockReturnShopifySyncMeta && (!savedStockReturnState.shopifyStockFile || !savedStockReturnState.shopifySkuEanFile)) {
+            clearStockReturnShopifySyncMeta();
+          }
+        }
+      } catch (err) {
+        console.error("Error loading Stock Return Shopify files:", err);
+      } finally {
+        if (!cancelled) {
+          setIsStockReturnShopifyStockLoading(false);
+        }
+      }
+    };
+
+    loadStockReturnShopifyStock();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [stockReturnShopifySyncMeta]);
+
+  const handleRetaggingShopifyStockFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setRetaggingShopifyStockFile(file);
+    setRetaggingShopifySkuEanFile(null);
+    setRetaggingShopifySyncError(null);
+    clearRetaggingShopifySyncMeta();
+    try {
+      await saveRetaggingShopifyStockFile(file);
+      await saveRetaggingShopifySkuEanFile(null);
+      await clearRetaggingResult();
+    } catch (err) {
+      console.error("Error saving Retagging Shopify stock file:", err);
+      setRetaggingShopifySyncError("Could not save Retagging Shopify stock file");
+    }
+  };
+
+  const handleRetaggingShopifyStockFileRemove = async () => {
+    setRetaggingShopifyStockFile(null);
+    setRetaggingShopifySkuEanFile(null);
+    setRetaggingShopifySyncError(null);
+    clearRetaggingShopifySyncMeta();
+    try {
+      await saveRetaggingShopifyStockFile(null);
+      await saveRetaggingShopifySkuEanFile(null);
+      await clearRetaggingResult();
+    } catch (err) {
+      console.error("Error removing Retagging Shopify stock file:", err);
+      setRetaggingShopifySyncError("Could not remove Retagging Shopify stock file");
+    }
+  };
+
+  const handleStockReturnShopifyStockFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setStockReturnShopifyStockFile(file);
+    setStockReturnShopifySyncError(null);
+    clearStockReturnShopifySyncMeta();
+    try {
+      await saveStockReturnShopifyStockFile(file);
+      await clearStockReturnResult();
+    } catch (err) {
+      console.error("Error saving Stock Return Shopify stock file:", err);
+      setStockReturnShopifySyncError("Could not save Stock Return Shopify stock file");
+    }
+  };
+
+  const handleStockReturnShopifyStockFileRemove = async () => {
+    setStockReturnShopifyStockFile(null);
+    setStockReturnShopifySyncError(null);
+    clearStockReturnShopifySyncMeta();
+    try {
+      await saveStockReturnShopifyStockFile(null);
+      await clearStockReturnResult();
+    } catch (err) {
+      console.error("Error removing Stock Return Shopify stock file:", err);
+      setStockReturnShopifySyncError("Could not remove Stock Return Shopify stock file");
+    }
+  };
+
+  const handleStockReturnShopifySkuEanFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setStockReturnShopifySkuEanFile(file);
+    setStockReturnShopifySyncError(null);
+    clearStockReturnShopifySyncMeta();
+    try {
+      await saveStockReturnShopifySkuEanFile(file);
+      await clearStockReturnResult();
+    } catch (err) {
+      console.error("Error saving Stock Return Shopify SKU/EAN file:", err);
+      setStockReturnShopifySyncError("Could not save Stock Return Shopify SKU/EAN file");
+    }
+  };
+
+  const handleStockReturnShopifySkuEanFileRemove = async () => {
+    setStockReturnShopifySkuEanFile(null);
+    setStockReturnShopifySyncError(null);
+    clearStockReturnShopifySyncMeta();
+    try {
+      await saveStockReturnShopifySkuEanFile(null);
+      await clearStockReturnResult();
+    } catch (err) {
+      console.error("Error removing Stock Return Shopify SKU/EAN file:", err);
+      setStockReturnShopifySyncError("Could not remove Stock Return Shopify SKU/EAN file");
+    }
+  };
+
+  const handleZfsFileChange = (
+    event: React.ChangeEvent<HTMLInputElement>,
+    type: keyof FileState
+  ) => {
+    if (type === "internal" || type === "skuEanMapper") {
+      clearZfsShopifySyncMeta();
+    }
+    handleFileChange(event, type);
+  };
+
+  const handleZfsRemoveFile = (fileName: string, type: keyof FileState) => {
+    if (type === "internal" || type === "skuEanMapper") {
+      clearZfsShopifySyncMeta();
+    }
+    handleRemoveFile(fileName, type);
+  };
+
+  useEffect(() => {
     if (isProcessing) {
       setShouldScroll(true);
       setHasProcessed(false);
@@ -806,21 +1431,14 @@ const IntegratedStockParser: React.FC = () => {
 
   // Update resetFiles to only clear ZFS data
   const resetZFSFiles = async () => {
-    resetFiles(); // Original ZFS reset logic - this already has storeType 'zfs'
-    
-    // Clear only ZFS data from IndexedDB
-    try {
-      await clearFiles('zfs');
-      await clearStoredData('zfs');
-      if (zfsBlacklist.length > 0) {
-        await storeBlacklist(zfsBlacklist, 'zfs');
-      }
-      console.log("ZFS data cleared from IndexedDB");
-    } catch (err) {
-      console.error("Error clearing ZFS data:", err);
-    }
+    await resetFiles();
+    setZfsCoverageDays(14);
+    setZfsSafetyFactor(0);
+    setZfsTrendFactor(0);
+    clearZfsShopifySyncMeta();
+    clearZfsSettings();
   };
-  
+
   // Update FBA reset to only clear FBA data
   const resetFBAFiles = async () => {
     // Clear FBA state
@@ -831,29 +1449,13 @@ const IntegratedStockParser: React.FC = () => {
     setFbaData({
       sellerboardStock: [],
     });
-    
+    clearFbaSettings();
+
     // Clear only FBA data from IndexedDB
     try {
       await clearFiles('fba');
-      
-      // Reset stored data but maintain default coverage days
-      await storeData({
-        parsedData: {
-          internal: [],
-          zfs: [],
-          zfsShipments: [],
-          zfsShipmentsReceived: [],
-          skuEanMapper: [],
-          zfsSales: [],
-          integrated: [],
-          sellerboardStock: []
-        },
-        recommendations: [],
-        coverageDays: 14,
-        blacklist: Array.from(fbaBlacklistRef.current)
-      }, 'fba');
-      
-      console.log("FBA data cleared from IndexedDB");
+
+      await resetFbaData(Array.from(fbaBlacklistRef.current));
     } catch (err) {
       console.error("Error clearing FBA data:", err);
     }
@@ -865,27 +1467,10 @@ const IntegratedStockParser: React.FC = () => {
     setFbaData({
       sellerboardStock: [],
     });
-    
+
     // Clear only FBA data from storage while preserving files
     try {
-      const savedData = await getStoredData('fba');
-      if (savedData) {
-        await storeData({
-          ...savedData,
-          parsedData: {
-            internal: [],
-            zfs: [],
-            zfsShipments: [],
-            zfsShipmentsReceived: [],
-            skuEanMapper: [],
-            zfsSales: [],
-            integrated: [],
-            sellerboardStock: []
-          },
-          blacklist: Array.from(fbaBlacklistRef.current)
-        }, 'fba');
-        console.log("FBA tables cleared from IndexedDB");
-      }
+      await clearFbaTablesData(Array.from(fbaBlacklistRef.current));
     } catch (err) {
       console.error("Error clearing FBA tables:", err);
     }
@@ -898,7 +1483,6 @@ const IntegratedStockParser: React.FC = () => {
       try {
         const storedFile = await getGenericData(RELATIVE_STOCK_FILE_KEY);
         if (storedFile instanceof File) {
-          console.log("Loaded persisted export file:", storedFile.name);
           setExportFile(storedFile);
         }
 
@@ -917,14 +1501,13 @@ const IntegratedStockParser: React.FC = () => {
               (item.isDefaultBinLocation === undefined || item.isDefaultBinLocation === null || typeof item.isDefaultBinLocation === 'boolean')
           )
         ) {
-          console.log(`Loaded persisted relative stock table data with ${storedTableData.length} items.`);
           // Cast to the new type
           setRelativeStockData(storedTableData as {
              articleNumber: string;
              warehouse?: string;
              binLocation?: string;
              isDefaultBinLocation?: boolean;
-             physicalStock: number; 
+             physicalStock: number;
           }[]);
         } else if (storedTableData) {
           console.warn("Persisted table data has incorrect structure. Clearing.");
@@ -946,12 +1529,11 @@ const IntegratedStockParser: React.FC = () => {
     const file = event.target.files?.[0];
     if (file) {
       setExportFile(file);
-      setRelativeStockData([]); 
+      setRelativeStockData([]);
       setExportError(null);
       try {
         await storeGenericData(RELATIVE_STOCK_FILE_KEY, file);
-        console.log("Stored export file in IndexedDB");
-        await clearGenericData(RELATIVE_STOCK_TABLE_KEY); 
+        await clearGenericData(RELATIVE_STOCK_TABLE_KEY);
       } catch (err) {
         console.error("Error storing export file:", err);
       }
@@ -959,14 +1541,13 @@ const IntegratedStockParser: React.FC = () => {
   };
 
   // Handle file removal for export using generic functions
-  const handleExportFileRemove = async () => { 
+  const handleExportFileRemove = async () => {
     setExportFile(null);
     setRelativeStockData([]);
     setExportError(null);
     try {
       await clearGenericData(RELATIVE_STOCK_FILE_KEY);
       await clearGenericData(RELATIVE_STOCK_TABLE_KEY);
-      console.log("Cleared persisted relative stock file and table data.");
     } catch (err) {
       console.error("Error clearing persisted relative stock data:", err);
     }
@@ -981,24 +1562,21 @@ const IntegratedStockParser: React.FC = () => {
     setRelativeStockData([]);
 
     try {
-      const parsedData = await parseFile(exportFile, (progress) => {
-        // Optional: update status if needed, though it might be quick
-        console.log(`Parsing progress: ${progress}%`);
-      });
+      const parsedData = await parseFile(exportFile);
 
       if (!parsedData || parsedData.length === 0) {
         throw new Error("File is empty or could not be parsed.");
       }
 
       const headers = Object.keys(parsedData[0]);
-      
-      // --- Define expected column headers (Only required ones now) --- 
+
+      // --- Define expected column headers (Only required ones now) ---
       const expectedHeaders = {
           sku: ["Partner Variant Size", "SKU"],
           stock: ["Recommended Stock", "Recommended Quantity"],
       };
 
-      // --- Find actual column names used in the file --- 
+      // --- Find actual column names used in the file ---
       const findHeader = (possibleNames: string[]): string | null => {
           for (const name of possibleNames) {
               if (headers.includes(name)) return name;
@@ -1010,26 +1588,24 @@ const IntegratedStockParser: React.FC = () => {
       const stockColumn = findHeader(expectedHeaders.stock);
       // No longer need to find warehouse, binLocation, isDefault columns
 
-      // --- Validate required columns --- 
+      // --- Validate required columns ---
       if (!skuColumn || !stockColumn) {
            const missing = [!skuColumn ? "SKU/Partner Variant Size" : null, !stockColumn ? "Recommended Stock/Quantity" : null].filter(Boolean).join(' and ');
            throw new Error(`Required columns (${missing}) not found in the file.`);
       }
-      console.log("Found required columns:", { skuColumn, stockColumn });
-
       // --- Process rows, handling SET SKUs and aggregating ---
-      const processedItems: { 
-        articleNumber: string; 
-        warehouse?: string; 
-        binLocation?: string; 
-        isDefaultBinLocation?: boolean; 
-        physicalStock: number; 
+      const processedItems: {
+        articleNumber: string;
+        warehouse?: string;
+        binLocation?: string;
+        isDefaultBinLocation?: boolean;
+        physicalStock: number;
       }[] = [];
-      const baseSkuStock: Record<string, { 
-          warehouse?: string; 
-          binLocation?: string; 
-          isDefaultBinLocation?: boolean; 
-          physicalStock: number; 
+      const baseSkuStock: Record<string, {
+          warehouse?: string;
+          binLocation?: string;
+          isDefaultBinLocation?: boolean;
+          physicalStock: number;
       }> = {};
 
       for (const row of parsedData) {
@@ -1050,7 +1626,7 @@ const IntegratedStockParser: React.FC = () => {
           if (parts.length === 2) {
             const prefix = parts[0];
             const suffix = parts[1];
-            
+
             // Generate Variant SKU
             const variantSku = `${prefix}-${suffix}`;
             processedItems.push({
@@ -1058,7 +1634,7 @@ const IntegratedStockParser: React.FC = () => {
               warehouse,
               binLocation,
               isDefaultBinLocation,
-              physicalStock: stockNum 
+              physicalStock: stockNum
             });
 
             // Generate Base SKU and aggregate stock
@@ -1067,11 +1643,11 @@ const IntegratedStockParser: React.FC = () => {
             const baseSku = `${prefix}-${baseSuffix}`;
 
             if (!baseSkuStock[baseSku]) {
-              baseSkuStock[baseSku] = { 
-                warehouse, 
-                binLocation, 
-                isDefaultBinLocation, 
-                physicalStock: 0 
+              baseSkuStock[baseSku] = {
+                warehouse,
+                binLocation,
+                isDefaultBinLocation,
+                physicalStock: 0
               };
             }
             baseSkuStock[baseSku].physicalStock += stockNum;
@@ -1105,22 +1681,17 @@ const IntegratedStockParser: React.FC = () => {
           ...baseSkuStock[baseSku]
         });
       }
-      
-      console.log(`Processed ${parsedData.length} rows into ${processedItems.length} items (incl. generated SKUs).`);
-
 
       if (processedItems.length === 0) {
         throw new Error("No valid data rows found after processing.");
       }
-      
-      // --- Sort by articleNumber --- 
+
+      // --- Sort by articleNumber ---
       processedItems.sort((a, b) => a.articleNumber.localeCompare(b.articleNumber));
-      console.log("Sorted data (first 10):", processedItems.slice(0, 10));
 
       // Set state and persist
       setRelativeStockData(processedItems);
       await storeGenericData(RELATIVE_STOCK_TABLE_KEY, processedItems);
-      console.log("Stored updated table data in IndexedDB");
 
     } catch (err) {
       console.error("Error processing export file:", err);
@@ -1143,7 +1714,6 @@ const IntegratedStockParser: React.FC = () => {
       // Clear the specific keys used by this feature
       await clearGenericData(RELATIVE_STOCK_FILE_KEY);
       await clearGenericData(RELATIVE_STOCK_TABLE_KEY);
-      console.log("Cleared persisted relative stock data on overlay close.");
        // Also reset the state now that persistence is cleared
        setExportFile(null);
        setRelativeStockData([]);
@@ -1158,7 +1728,7 @@ const IntegratedStockParser: React.FC = () => {
        setExportError(null);
     }
   };
-  
+
   // Open Overlay function
   const handleOpenOverlay = () => {
     // Reset transient states
@@ -1170,7 +1740,7 @@ const IntegratedStockParser: React.FC = () => {
 
   return (
     <>
-      <LoadingOverlay isLoading={isProcessing || isLoadingPersistedData} message={processingStatus || (isLoadingPersistedData ? 'Loading data...' : '')} />
+      <LoadingOverlay isLoading={isProcessing} message={processingStatus} />
       <BlacklistModal
         isOpen={showZfsBlacklistModal}
         title="ZFS Blacklisted SKUs"
@@ -1191,89 +1761,95 @@ const IntegratedStockParser: React.FC = () => {
       />
 
       {/* Modern Header */}
-      <div className="bg-white py-6 mb-6 border-b border-gray-200">
-        <div className="container mx-auto pl-4 pr-10 relative flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="mb-6 border-b border-slate-200 bg-white/95 py-5 shadow-[0_1px_8px_rgba(15,23,42,0.04)]">
+        <div className="container mx-auto flex flex-col items-center gap-4 px-4 lg:px-10 xl:grid xl:grid-cols-[1fr_auto_1fr]">
+          <NavLink
+            to="/"
+            className="flex items-center gap-4 xl:justify-self-start"
+            aria-label="Open inventory tools home"
+          >
             <img
               src="/Blackskies-Logo.png"
               alt="Blackskies Logo"
-              className="h-16"
+              className="h-14 sm:h-16"
             />
-            <h1 className="text-2xl font-normal tracking-tight text-gray-900">Inventory Management</h1>
-          </div>
+          </NavLink>
 
-          {/* Tabs (centered) */}
-          <nav className="absolute left-1/2 -translate-x-1/2 flex gap-8">
-            <NavLink
-              to="/zfs"
-              className={({ isActive }) =>
-                `px-3 py-4 text-lg font-semibold transition-colors border-b-2 ${
-                  isActive
-                    ? "text-gray-900 border-gray-900"
-                    : "text-gray-500 hover:text-gray-900 border-transparent"
-                }`
-              }
-            >
-              ZFS
-            </NavLink>
-            <NavLink
-              to="/fba"
-              className={({ isActive }) =>
-                `px-3 py-4 text-lg font-semibold transition-colors border-b-2 ${
-                  isActive
-                    ? "text-gray-900 border-gray-900"
-                    : "text-gray-500 hover:text-gray-900 border-transparent"
-                }`
-              }
-            >
-              FBA
-            </NavLink>
+          <nav
+            className="flex flex-wrap justify-center gap-1 border border-slate-200 bg-slate-50 p-1 shadow-inner xl:justify-self-center"
+            aria-label="Primary"
+          >
+            {toolLinks.map((tool) => (
+              <NavLink
+                key={tool.to}
+                to={tool.to}
+                className={({ isActive }) =>
+                  `px-4 py-2.5 text-base font-semibold transition-colors sm:px-5 ${
+                    isActive
+                      ? "bg-white text-slate-950 shadow-sm"
+                      : "text-slate-500 hover:bg-white/70 hover:text-slate-900"
+                  }`
+                }
+              >
+                {tool.title}
+              </NavLink>
+            ))}
           </nav>
 
-          <div className="flex items-center gap-3">
-            {onZfsRoute && (
-              <div className="relative">
-                <button
-                  onClick={handleShopifySync}
-                  disabled={isShopifySyncing}
-                  className="inline-flex items-center gap-2 px-5 py-2.5 text-base font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  title="Pull Internal Stocks and SKU/EAN data directly from Shopify"
-                >
-                  {isShopifySyncing ? 'Syncing…' : 'Sync from Shopify'}
-                </button>
-                {shopifySyncMeta && (
-                  <span className="absolute right-0 top-full mt-1 text-xs text-gray-500 whitespace-nowrap">
-                    Last synced {timeAgo(shopifySyncMeta.lastSyncedAt)}
+          {(onHomeRoute || canSyncShopify) && (
+            <div className="flex flex-wrap items-center justify-center gap-3 xl:justify-self-end">
+              {canSyncShopify && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => handleShopifySync()}
+                    disabled={shopifySyncDisabled}
+                    className="inline-flex items-center gap-2 whitespace-nowrap bg-emerald-600 px-5 py-3 text-base font-semibold text-white shadow-sm transition-all hover:bg-emerald-700 hover:shadow disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-emerald-600 disabled:hover:shadow-sm"
+                    title="Pull Internal Stocks and SKU/EAN data directly from Shopify"
+                  >
+                    {isShopifySyncing && (
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    )}
+                    {isShopifySyncing ? 'Syncing Shopify...' : 'Sync from Shopify'}
+                  </button>
+                  <span
+                    className={`absolute right-0 top-full mt-1 whitespace-nowrap text-base ${
+                      isShopifySyncing ? "font-medium text-emerald-700" : "text-slate-500"
+                    }`}
+                  >
+                    {shopifySyncStatusText}
                   </span>
-                )}
-              </div>
-            )}
-            <button
-              className="px-5 py-2 text-sm font-semibold text-white bg-black rounded-full hover:bg-gray-800 transition-all duration-200 shadow-sm hover:shadow disabled:opacity-50 disabled:cursor-not-allowed"
-              onClick={handleOpenOverlay}
-              title="Use this to export adjusted stock deductions for both ZFS & FBA shipments"
-              disabled={isLoadingPersistedData}
-            >
-              Relative Stock Export
-            </button>
-          </div>
+                </div>
+              )}
+              {onHomeRoute && (
+                <button
+                  className="whitespace-nowrap border border-slate-900 bg-slate-950 px-5 py-3 text-base font-semibold text-white shadow-sm transition-all duration-200 hover:bg-slate-800 hover:shadow disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={handleOpenOverlay}
+                  title="Use this to export adjusted stock deductions for both ZFS & FBA shipments"
+                  disabled={isLoadingPersistedData}
+                >
+                  Relative Stock Export
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
-      
+
       {/* Relative Stock Export Overlay */}
       {showExportOverlay && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-gray-50 rounded-lg w-full max-w-4xl p-6 relative flex flex-col max-h-[90vh]">
+          <div className="relative flex max-h-[90vh] w-full max-w-4xl flex-col bg-slate-50 p-6 shadow-2xl">
             <button
               onClick={handleCloseOverlay}
-              className="absolute top-6 right-6 text-gray-500 hover:text-gray-900 hover:bg-white rounded-full p-1.5 transition-colors z-10"
+              className="absolute right-6 top-6 z-10 p-1.5 text-slate-500 transition-colors hover:bg-white hover:text-slate-900"
             >
               <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               </svg>
             </button>
 
-            <h2 className="text-xl font-bold mb-6 flex-shrink-0 text-gray-900">Create Stock Deduction File for Shopware</h2>
+            <h2 className="mb-6 flex-shrink-0 text-xl font-semibold text-slate-950">Create Stock Deduction File for Shopware</h2>
 
             <div className="flex-grow overflow-y-auto space-y-4"> {/* Make content area scrollable */}
               {processingExport ? (
@@ -1289,7 +1865,7 @@ const IntegratedStockParser: React.FC = () => {
                    <div className="flex justify-end mt-4">
                      <button
                       onClick={handleCloseOverlay}
-                      className="inline-flex justify-center py-2.5 px-5 border-2 border-gray-200 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all"
+                      className="ops-button-secondary"
                     >
                       Close
                     </button>
@@ -1311,14 +1887,14 @@ const IntegratedStockParser: React.FC = () => {
                   <div className="flex justify-end space-x-3 mt-4">
                     <button
                       onClick={handleCloseOverlay}
-                      className="inline-flex justify-center py-2.5 px-5 border-2 border-gray-200 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all"
+                      className="ops-button-secondary"
                     >
                       Cancel
                     </button>
                     <button
                       onClick={processExportFile}
                       disabled={!exportFile || processingExport}
-                      className="inline-flex justify-center py-2.5 px-6 border border-transparent rounded-lg text-sm font-semibold text-white bg-black hover:bg-gray-800 transition-all shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-black disabled:hover:shadow-md"
+                      className="ops-button-primary px-6"
                     >
                       Process
                     </button>
@@ -1330,32 +1906,39 @@ const IntegratedStockParser: React.FC = () => {
         </div>
       )}
 
-      <div className="container mx-auto px-4 pb-6">
+      <div className="w-full pb-6">
         {/* Main Card */}
-        <div className="bg-gray-50 overflow-hidden">
+        <div className="overflow-hidden bg-slate-50">
           {/* Content Area */}
-          <div className="p-6">
+          <div className="p-4 sm:p-6">
             <Routes>
-              <Route path="/" element={<Navigate to="/zfs" replace />} />
+              <Route path="/" element={<ToolHome />} />
               <Route path="/zfs" element={
               <ZFSContent
                 files={files}
                 parsedData={filteredParsedData}
-                recommendations={filteredRecommendations}
+                recommendations={zfsRecommendationsForDisplay}
                 timeline={timeline}
                 error={error}
                 isProcessing={isProcessing}
-                handleFileChange={handleFileChange}
-                handleRemoveFile={handleRemoveFile}
+                handleFileChange={handleZfsFileChange}
+                handleRemoveFile={handleZfsRemoveFile}
                 processFiles={processFiles}
                 setTimeline={setTimeline}
                 resetFiles={resetZFSFiles}
                 clearTables={clearTables}
                 setError={setError}
-                showTabs={showTabs}
+                showTabs={showTabs && (zfsRecommendationSettingsLoaded || filteredRecommendations.length === 0)}
                 tabsRef={tabsRef}
                 onOpenBlacklist={() => setShowZfsBlacklistModal(true)}
                 blacklistCount={zfsBlacklist.length}
+                zfsRecommendationSettingsLoaded={zfsRecommendationSettingsLoaded}
+                zfsCoverageDays={zfsCoverageDays}
+                zfsSafetyFactor={zfsSafetyFactor}
+                zfsTrendFactor={zfsTrendFactor}
+                onZfsCoverageDaysChange={handleZfsCoverageDaysChange}
+                onZfsSafetyFactorChange={handleZfsSafetyFactorChange}
+                onZfsTrendFactorChange={handleZfsTrendFactorChange}
               />
               } />
               <Route path="/fba" element={
@@ -1370,7 +1953,44 @@ const IntegratedStockParser: React.FC = () => {
                 onOpenBlacklist={() => setShowFbaBlacklistModal(true)}
               />
               } />
-              <Route path="*" element={<Navigate to="/zfs" replace />} />
+              <Route path="/retagging" element={
+              <RetaggingDecisionTool
+                shopifyStockFile={retaggingShopifyStockFile}
+                shopifySkuEanMapperFile={retaggingShopifySkuEanFile}
+                onShopifyStockFileChange={handleRetaggingShopifyStockFileChange}
+                onShopifyStockFileRemove={handleRetaggingShopifyStockFileRemove}
+                shopifySyncError={retaggingShopifySyncError}
+                isShopifyStockLoading={isRetaggingShopifyStockLoading}
+              />
+              } />
+              <Route path="/sale-prices" element={<ZalandoSalePriceTool />} />
+              <Route path="/stock-return" element={
+              <StockReturnTool
+                shopifyStockFile={stockReturnShopifyStockFile}
+                shopifySkuEanMapperFile={stockReturnShopifySkuEanFile}
+                onShopifyStockFileChange={handleStockReturnShopifyStockFileChange}
+                onShopifyStockFileRemove={handleStockReturnShopifyStockFileRemove}
+                onShopifySkuEanMapperFileChange={handleStockReturnShopifySkuEanFileChange}
+                onShopifySkuEanMapperFileRemove={handleStockReturnShopifySkuEanFileRemove}
+                shopifySyncError={stockReturnShopifySyncError}
+                isShopifyStockLoading={isStockReturnShopifyStockLoading}
+              />
+              } />
+              <Route path="/barcodes" element={
+              <BarcodePdfTool
+                shopifyResult={barcodeShopifyResult}
+                shopifyBrand={barcodeShopifyBrand ?? syncingBarcodeBrand}
+                shopifySyncedAt={barcodeShopifySyncedAt}
+                shopifyError={barcodeShopifySyncError}
+                isShopifyStateLoading={isBarcodeShopifyStateLoading}
+                isShopifySyncing={syncingShopifyModule === 'barcodes'}
+                syncingShopifyBrand={syncingBarcodeBrand}
+                onShopifySync={handleShopifySync}
+                onCsvSourceActiveChange={handleBarcodeCsvSourceActiveChange}
+                onClearShopifyData={clearBarcodeShopifyData}
+              />
+              } />
+              <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </div>
         </div>

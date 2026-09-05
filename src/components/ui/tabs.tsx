@@ -12,11 +12,11 @@ interface TabsProps {
 
 export function Tabs({ tabs, id = "default-tabs" }: TabsProps) {
   const storageKey = `activeTab-${id}`;
-  
+
   // Initialize state from localStorage or use the first tab
   const [activeTab, setActiveTab] = React.useState(() => {
     if (tabs.length === 0) return "";
-    
+
     const savedTab = localStorage.getItem(storageKey);
     // Check if the saved tab still exists in the current tabs
     if (savedTab && tabs.some(tab => tab.id === savedTab)) {
@@ -24,7 +24,7 @@ export function Tabs({ tabs, id = "default-tabs" }: TabsProps) {
     }
     return tabs[0]?.id;
   });
-  
+
   // Save the active tab to localStorage whenever it changes
   React.useEffect(() => {
     if (activeTab) {
@@ -34,17 +34,17 @@ export function Tabs({ tabs, id = "default-tabs" }: TabsProps) {
 
   return (
     <div>
-      <div className="border-b border-gray-200 flex justify-center">
-        <nav className="-mb-px flex space-x-8 justify-center" aria-label="Tabs">
+      <div className="border border-slate-200 bg-slate-50 p-1 shadow-inner">
+        <nav className="flex flex-wrap gap-1" aria-label="Tabs">
           {tabs.map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
               className={cn(
-                "whitespace-nowrap py-4 px-6 border-b-2 font-medium text-sm",
+                "whitespace-nowrap px-4 py-2.5 text-base font-semibold transition-colors sm:px-5",
                 activeTab === tab.id
-                  ? "border-green-500 text-green-600"
-                  : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
+                  ? "bg-white text-slate-950 shadow-sm"
+                  : "text-slate-500 hover:bg-white/70 hover:text-slate-900"
               )}
             >
               {tab.label}
@@ -52,7 +52,7 @@ export function Tabs({ tabs, id = "default-tabs" }: TabsProps) {
           ))}
         </nav>
       </div>
-      <div className="mt-6 max-w-7xl mx-auto h-[calc(100vh-100px)] overflow-hidden">
+      <div className="mt-5 w-full">
         {tabs.find((tab) => tab.id === activeTab)?.content}
       </div>
     </div>

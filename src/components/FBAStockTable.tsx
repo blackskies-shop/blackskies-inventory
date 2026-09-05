@@ -1,11 +1,18 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { X, Search } from "lucide-react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import { Download, Search } from "lucide-react";
 import { ProcessedSellerboardStock } from "@/types/processors";
 import { usePagination } from "@/hooks/usePagination";
-import { ExportButton } from "./ExportButton";
 import { Pagination } from "./ui/pagination";
 import { CoverageDaysSelector } from "./CoverageDaysSelector";
-import { getStoredData, storeData } from "@/lib/indexedDB";
+import { FactorAdjuster } from "./FactorAdjuster";
+import { exportToCSV } from "@/utils/exporters/csvExporter";
+import { exportToXLSX } from "@/utils/exporters/xlsxExporter";
+import {
+  loadFbaSettings,
+  saveFbaSafetyFactor,
+  saveFbaSellerboardStock,
+  saveFbaTrendFactor
+} from "@/lib/appPersistence";
 
 interface FBAStockTableProps {
   data: ProcessedSellerboardStock[];
@@ -31,22 +38,71 @@ const COLUMNS = [
 // Display columns (excluding Product Name)
 const DISPLAY_COLUMNS = COLUMNS.filter(column => column.key !== "Product Name");
 
+// Recalculate a single item using the FBA formula (mirrors sellerboardStockProcessor)
+function recalcItem(
+  item: ProcessedSellerboardStock,
+  days: number,
+  safety: number,
+  trend: number
+): ProcessedSellerboardStock {
+  const dailySales = item["Avg. Daily Sales"] || 0;
+  const refundPercentage = item["Avg. Return Rate (%)"] || 0;
+  const fbaQuantity = item["FBA Quantity"] || 0;
+  const unitsInTransit = item["Units In Transit"] || 0;
+  const reservedUnits = item["Reserved Units"] || 0;
+  const totalStock = fbaQuantity + unitsInTransit + reservedUnits;
+
+  let newRecommendedQuantity = Math.round(
+    dailySales *
+      days *
+      (1 - refundPercentage / 100) *
+      (1 + safety / 100) *
+      (1 + trend / 100) *
+      ((dailySales * 30) > 10 ? 1.2 : 1) -
+      totalStock
+  );
+
+  newRecommendedQuantity = Math.max(0, newRecommendedQuantity);
+
+  if (
+    newRecommendedQuantity === 0 &&
+    totalStock === 0 &&
+    (item["Internal Stock"] || 0) > 0
+  ) {
+    newRecommendedQuantity = 1;
+  }
+
+  return {
+    ...item,
+    "Recommended Quantity": newRecommendedQuantity,
+    "Coverage Period (Days)": days,
+  };
+}
+
 export const FBAStockTable: React.FC<FBAStockTableProps> = ({ data }) => {
   const [isClient, setIsClient] = useState(false);
   const [searchSku, setSearchSku] = useState('');
-  const [isSearching, setIsSearching] = useState(false);
   const [coverageDays, setCoverageDays] = useState(14);
+  const [safetyFactor, setSafetyFactor] = useState(0);
+  const [trendFactor, setTrendFactor] = useState(0);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [displayData, setDisplayData] = useState<ProcessedSellerboardStock[]>(data);
+  const tableScrollRef = useRef<HTMLDivElement | null>(null);
+  const tableDragRef = useRef({
+    isDragging: false,
+    startX: 0,
+    scrollLeft: 0,
+  });
+  const [isTableDragging, setIsTableDragging] = useState(false);
 
-  // Update initial data once
+  // Re-apply factors whenever the data prop or any setting changes
   useEffect(() => {
-    // Initialize display data from the props
-    setDisplayData(data);
-  }, [data]);
+    setDisplayData(data.map((item) => recalcItem(item, coverageDays, safetyFactor, trendFactor)));
+  }, [data, coverageDays, safetyFactor, trendFactor]);
 
   const filteredData = useMemo(() => {
     if (!searchSku) return displayData;
-    return displayData.filter(item => 
+    return displayData.filter(item =>
       item.SKU.toLowerCase().includes(searchSku.toLowerCase()) ||
       item.ASIN.toLowerCase().includes(searchSku.toLowerCase())
     );
@@ -57,195 +113,217 @@ export const FBAStockTable: React.FC<FBAStockTableProps> = ({ data }) => {
     ITEMS_PER_PAGE
   );
 
-  // Load coverage days from IndexedDB when component mounts
+  // Load recommendation settings from persistence when component mounts
   useEffect(() => {
-    const loadCoverageDays = async () => {
+    let cancelled = false;
+
+    const loadSettings = async () => {
       try {
-        const savedData = await getStoredData('fba');
-        if (savedData?.coverageDays) {
-          setCoverageDays(savedData.coverageDays);
+        const settings = await loadFbaSettings();
+        if (!cancelled) {
+          setCoverageDays(settings.coverageDays);
+          setSafetyFactor(settings.safetyFactor);
+          setTrendFactor(settings.trendFactor);
         }
       } catch (err) {
-        console.error("Error loading coverage days:", err);
+        console.error("Error loading FBA recommendation settings:", err);
+      } finally {
+        if (!cancelled) {
+          setSettingsLoaded(true);
+        }
       }
     };
-    
-    loadCoverageDays();
+
+    loadSettings();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Efficient coverage days change handler - save to IndexedDB and recalculate recommendations
-  const handleCoverageDaysChange = async (days: number) => {
-    setCoverageDays(days);
-    
-    // Recalculate the recommended quantities with the new coverage days
-    try {
-      const savedData = await getStoredData('fba');
-      if (savedData?.parsedData?.sellerboardStock) {
-        // Instead of reprocessing everything, calculate only the new recommended quantities
-        setDisplayData(prevData => {
-          return prevData.map(item => {
-            const dailySales = item["Avg. Daily Sales"] || 0;
-            const refundPercentage = item["Avg. Return Rate (%)"] || 0;
-            const fbaQuantity = item["FBA Quantity"] || 0;
-            const unitsInTransit = item["Units In Transit"] || 0;
-            const reservedUnits = item["Reserved Units"] || 0;
-            const totalStock = fbaQuantity + unitsInTransit + reservedUnits;
-            
-            // Calculate new recommended quantity using the same formula as in sellerboardStockProcessor
-            let newRecommendedQuantity = Math.round(
-              dailySales * 
-              days * 
-              (1 - (refundPercentage / 100)) * 
-              ((dailySales * 30) > 10 ? 1.2 : 1) - 
-              totalStock
-            );
-
-            // Ensure recommended quantity is not negative
-            newRecommendedQuantity = Math.max(0, newRecommendedQuantity);
-
-            // Enforce minimum of 1 if we have internal stock and no external FBA stock
-            if (newRecommendedQuantity === 0 && totalStock === 0 && (item["Internal Stock"] || 0) > 0) {
-              newRecommendedQuantity = 1;
-            }
-            
-            return {
-              ...item,
-              "Recommended Quantity": newRecommendedQuantity,
-              "Coverage Period (Days)": days
-            };
-          });
-        });
-        
-        // Update only the recommended quantity in the stored data
-        const updatedStoredData = savedData.parsedData.sellerboardStock.map(item => {
-          const dailySales = item["Avg. Daily Sales"] || 0;
-          const refundPercentage = item["Avg. Return Rate (%)"] || 0;
-          const fbaQuantity = item["FBA Quantity"] || 0;
-          const unitsInTransit = item["Units In Transit"] || 0;
-          const reservedUnits = item["Reserved Units"] || 0;
-          const totalStock = fbaQuantity + unitsInTransit + reservedUnits;
-          
-          let newRecommendedQuantity = Math.round(
-            dailySales * 
-            days * 
-            (1 - (refundPercentage / 100)) * 
-            ((dailySales * 30) > 10 ? 1.2 : 1) - 
-            totalStock
-          );
-
-          // Ensure recommended quantity is not negative
-          newRecommendedQuantity = Math.max(0, newRecommendedQuantity);
-
-          // Enforce minimum of 1 if we have internal stock and no external FBA stock
-          if (newRecommendedQuantity === 0 && totalStock === 0 && (item["Internal Stock"] || 0) > 0) {
-            newRecommendedQuantity = 1;
-          }
-          
-          return {
-            ...item,
-            "Recommended Quantity": newRecommendedQuantity,
-            "Coverage Period (Days)": days
-          };
-        });
-        
-        // Store the updated data
-        await storeData({
-          ...savedData,
-          parsedData: {
-            ...savedData.parsedData,
-            sellerboardStock: updatedStoredData
-          },
-          coverageDays: days,
-          blacklist: savedData.blacklist || []
-        }, 'fba');
-      } else {
-        // If no processed data exists yet, just save the coverage days
-        await storeData({
-          parsedData: savedData?.parsedData || {
-            internal: [],
-            zfs: [],
-            zfsShipments: [],
-            zfsShipmentsReceived: [],
-            skuEanMapper: [],
-            zfsSales: [],
-            integrated: [],
-            sellerboardStock: []
-          },
-          recommendations: savedData?.recommendations || [],
-          coverageDays: days,
-          blacklist: savedData?.blacklist || []
-        }, 'fba');
-      }
-    } catch (err) {
-      console.error("Error updating with new coverage days:", err);
+  // Persist factors immediately when they change
+  useEffect(() => {
+    if (settingsLoaded) {
+      saveFbaSafetyFactor(safetyFactor);
     }
+  }, [safetyFactor, settingsLoaded]);
+
+  useEffect(() => {
+    if (settingsLoaded) {
+      saveFbaTrendFactor(trendFactor);
+    }
+  }, [trendFactor, settingsLoaded]);
+
+  // Persist coverage days + recalculated stock to IndexedDB when any input changes
+  const persistRecalc = async (days: number, safety: number, trend: number) => {
+    try {
+      const updatedStoredData = data.map((item) =>
+        recalcItem(item, days, safety, trend)
+      );
+      await saveFbaSellerboardStock(updatedStoredData, days);
+    } catch (err) {
+      console.error('Error persisting FBA recalc:', err);
+    }
+  };
+
+  const handleCoverageDaysChange = (days: number) => {
+    setCoverageDays(days);
+    persistRecalc(days, safetyFactor, trendFactor);
+  };
+
+  const handleSafetyFactorChange = (value: number) => {
+    setSafetyFactor(value);
+    persistRecalc(coverageDays, value, trendFactor);
+  };
+
+  const handleTrendFactorChange = (value: number) => {
+    setTrendFactor(value);
+    persistRecalc(coverageDays, safetyFactor, value);
   };
 
   useEffect(() => {
     setIsClient(true);
   }, [data]);
 
+  const exportRows = useMemo(() => (
+    displayData.map((item) => ({
+      "SKU": item.SKU,
+      "ASIN": item.ASIN,
+      "Product Name": item["Product Name"],
+      "FBA Quantity": item["FBA Quantity"],
+      "Units In Transit": item["Units In Transit"],
+      "Reserved Units": item["Reserved Units"],
+      "Total Stock": item["FBA Quantity"] + item["Units In Transit"] + item["Reserved Units"],
+      "Internal Stock": item["Internal Stock"],
+      "Recommended Quantity": item["Recommended Quantity"],
+      "Avg. Daily Sales": Number(item["Avg. Daily Sales"]?.toFixed(2) || 0),
+      "Avg. Total Sales (30 Days)": Math.round(item["Avg. Total Sales (30 Days)"] || 0),
+      "Avg. Return Rate (%)": Number(item["Avg. Return Rate (%)"]?.toFixed(2) || 0),
+      "Coverage Period (Days)": item["Coverage Period (Days)"] || coverageDays,
+    }))
+  ), [coverageDays, displayData]);
+
+  const exportFilename = `fba-stock-data-${new Date().toISOString().split("T")[0]}`;
+
+  const exportCsv = () => {
+    if (!exportRows.length) return;
+    exportToCSV(exportRows, exportFilename);
+  };
+
+  const exportXlsx = () => {
+    if (!exportRows.length) return;
+    exportToXLSX(exportRows, exportFilename);
+  };
+
+  const handleTablePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || !tableScrollRef.current) return;
+    const target = event.target as HTMLElement;
+    if (target.closest("button,input,select,a")) return;
+
+    tableDragRef.current = {
+      isDragging: true,
+      startX: event.clientX,
+      scrollLeft: tableScrollRef.current.scrollLeft,
+    };
+    setIsTableDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleTablePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!tableDragRef.current.isDragging || !tableScrollRef.current) return;
+    event.preventDefault();
+    const deltaX = event.clientX - tableDragRef.current.startX;
+    tableScrollRef.current.scrollLeft = tableDragRef.current.scrollLeft - deltaX;
+  };
+
+  const stopTableDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!tableDragRef.current.isDragging) return;
+    tableDragRef.current.isDragging = false;
+    setIsTableDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
   if (!isClient) {
     return null;
   }
 
   return (
-    <div className="space-y-4 h-full flex flex-col">
-      <div className="flex justify-between items-center mb-4">
-        <CoverageDaysSelector value={coverageDays} onChange={handleCoverageDaysChange} />
-        <div className="text-sm text-gray-700">
-          {filteredData.length} items with {coverageDays} days coverage
+    <div className="h-full flex flex-col">
+      <div className="ops-surface flex min-h-0 flex-1 flex-col rounded-[8px]">
+        <div className="ops-section-header">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="ops-title">FBA Stock Overview & Recommendation</h3>
+              <p className="ops-muted mt-1">
+                {filteredData.length.toLocaleString()} of {displayData.length.toLocaleString()} SKU rows.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={exportCsv}
+                disabled={!exportRows.length}
+                className="ops-button-secondary disabled:cursor-not-allowed disabled:text-slate-400"
+              >
+                <Download className="h-4 w-4" />
+                Export CSV
+              </button>
+              <button
+                type="button"
+                onClick={exportXlsx}
+                disabled={!exportRows.length}
+                className="ops-button-secondary disabled:cursor-not-allowed disabled:text-slate-400"
+              >
+                <Download className="h-4 w-4" />
+                Export Excel
+              </button>
+            </div>
+          </div>
         </div>
-        <ExportButton
-          data={displayData}
-          label="Export FBA Stock Overview & Recommendation"
-          filename="fba-stock-data"
-        />
-      </div>
-      <div className="bg-white rounded-lg border border-gray-200 shadow-sm flex-1 flex flex-col min-h-0">
-        <div className="overflow-auto flex-1">
-          <table className="w-full border-collapse">
-            <thead className="sticky top-0 bg-white z-10">
-              <tr className="bg-gray-50 border-b border-gray-200">
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                  <div className="flex items-center space-x-2">
-                    {isSearching ? (
-                      <div className="flex items-center w-full">
-                        <input
-                          type="text"
-                          value={searchSku}
-                          onChange={(e) => setSearchSku(e.target.value)}
-                          placeholder="Search SKU/ASIN..."
-                          className="w-full px-2 py-1 text-sm border rounded-l focus:outline-none focus:ring-1 focus:ring-green-500"
-                          autoFocus
-                        />
-                        <button
-                          onClick={() => {
-                            setIsSearching(false);
-                            setSearchSku('');
-                          }}
-                          className="px-2 py-1 border border-l-0 rounded-r hover:bg-gray-100"
-                        >
-                          <X className="w-4 h-4 text-gray-500" />
-                        </button>
-                      </div>
-                    ) : (
-                      <>
-                        <span>SKU/ASIN</span>
-                        <button
-                          onClick={() => setIsSearching(true)}
-                          className="hover:text-green-600 transition-colors"
-                        >
-                          <Search className="w-4 h-4" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </th>
-                {DISPLAY_COLUMNS.slice(1).map((column) => (
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4">
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-4">
+            <CoverageDaysSelector value={coverageDays} onChange={handleCoverageDaysChange} />
+            <FactorAdjuster label="Safety Factor" value={safetyFactor} onChange={handleSafetyFactorChange} />
+            <FactorAdjuster label="Trend Factor" value={trendFactor} onChange={handleTrendFactorChange} />
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-3">
+            <div className="text-base text-slate-700">
+              {filteredData.length} items with {coverageDays} days coverage
+            </div>
+            <label className="relative min-w-0 w-full flex-1 sm:min-w-[260px] lg:max-w-md">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <input
+                type="search"
+                value={searchSku}
+                onChange={(event) => setSearchSku(event.target.value)}
+                placeholder="Search SKU or ASIN"
+                className="ops-input w-full pl-10 pr-4"
+              />
+            </label>
+          </div>
+        </div>
+        <div
+          ref={tableScrollRef}
+          className={`max-h-[calc(100vh-260px)] flex-1 overflow-auto ${
+            isTableDragging ? "cursor-grabbing select-none" : "cursor-grab"
+          }`}
+          title="Drag horizontally to scroll the table"
+          onPointerDown={handleTablePointerDown}
+          onPointerMove={handleTablePointerMove}
+          onPointerUp={stopTableDrag}
+          onPointerCancel={stopTableDrag}
+          onPointerLeave={stopTableDrag}
+        >
+          <table className="ops-table min-w-[1700px]">
+            <thead>
+              <tr>
+                {DISPLAY_COLUMNS.map((column) => (
                   <th
                     key={column.key}
-                    className={`px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase ${
+                    className={`${
                       column.key === "FBA Quantity" ? "text-right" : ""
                     }`}
                   >
@@ -254,37 +332,37 @@ export const FBAStockTable: React.FC<FBAStockTableProps> = ({ data }) => {
                 ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-200">
+            <tbody>
               {paginatedItems.length > 0 ? (
                 paginatedItems.map((item, index) => (
-                  <tr key={`${item.SKU}-${index}`} className="hover:bg-gray-50 transition-colors">
-                    <td className="px-4 py-3 text-sm text-gray-900">{item.SKU}</td>
-                    <td className="px-4 py-3 text-sm text-gray-900">{item.ASIN}</td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                  <tr key={`${item.SKU}-${index}`}>
+                    <td>{item.SKU}</td>
+                    <td>{item.ASIN}</td>
+                    <td className="text-right font-medium tabular-nums">
                       {item["FBA Quantity"]}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {item["Units In Transit"]}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {item["Reserved Units"]}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {item["FBA Quantity"] + item["Units In Transit"] + item["Reserved Units"]}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {item["Internal Stock"]}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-semibold tabular-nums">
                       {item["Recommended Quantity"]}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {item["Avg. Daily Sales"]?.toFixed(2)}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {Math.round(item["Avg. Total Sales (30 Days)"] || 0)}
                     </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 text-right font-medium">
+                    <td className="text-right font-medium tabular-nums">
                       {item["Avg. Return Rate (%)"]?.toFixed(2)}
                     </td>
                   </tr>
@@ -292,19 +370,24 @@ export const FBAStockTable: React.FC<FBAStockTableProps> = ({ data }) => {
               ) : (
                 <tr>
                   <td
-                    colSpan={DISPLAY_COLUMNS.length + 1}
-                    className="px-4 py-8 text-center text-sm text-gray-500"
+                    colSpan={DISPLAY_COLUMNS.length}
+                    className="px-4 py-12 text-center"
                   >
-                    No data available
+                    <div className="mx-auto max-w-lg">
+                      <div className="text-base font-semibold text-slate-950">No matching FBA rows</div>
+                      <div className="mt-1 text-base text-slate-500">
+                        Adjust the search or confirm the uploaded files contain Sellerboard rows.
+                      </div>
+                    </div>
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
-        <div className="flex items-center justify-between px-4 py-3 bg-gray-50 border-t border-gray-200 sticky bottom-0">
-          <div className="text-sm text-gray-500">
-            Showing {(currentPage - 1) * ITEMS_PER_PAGE + 1} to{" "}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-5 py-4">
+          <div className="text-base text-slate-500">
+            Showing {filteredData.length > 0 ? (currentPage - 1) * ITEMS_PER_PAGE + 1 : 0} to{" "}
             {Math.min(currentPage * ITEMS_PER_PAGE, filteredData.length)} of{" "}
             {filteredData.length} entries
           </div>
@@ -317,4 +400,4 @@ export const FBAStockTable: React.FC<FBAStockTableProps> = ({ data }) => {
       </div>
     </div>
   );
-}; 
+};
