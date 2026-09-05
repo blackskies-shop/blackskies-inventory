@@ -1,6 +1,4 @@
-# Blackskies Inventory
-
-Internal inventory, replenishment, Zalando retagging, and ZFS stock-return tool for Blackskies.
+# Blackskies Inventory Tools
 
 ![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
