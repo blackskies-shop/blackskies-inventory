@@ -30,7 +30,6 @@ It runs fully through CSV/file uploads plus the existing Shopify Admin API sync.
 - Supports configurable restock controls: coverage days, sales timeline, safety factor, and demand/trend factor.
 - Exports ZFS, FBA, Retagging, and Stock Return outputs as CSV and Excel where applicable.
 - Previews and exports Zalando sale-price matching results before any Shopify write.
-- Uses sticky table headers and drag-to-scroll behavior for wide data tables.
 
 ## ZFS / FBA Restock Logic
 
