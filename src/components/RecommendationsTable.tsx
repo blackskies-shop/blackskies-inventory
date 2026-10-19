@@ -181,6 +181,8 @@ export const RecommendationsTable: React.FC<RecommendationsTableProps> = ({
               label="Demand adjustment"
               value={trendFactor}
               onChange={onTrendFactorChange}
+              presets={[-30, -20, -10, 10, 20, 30]}
+              min={-100}
             />
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-4">

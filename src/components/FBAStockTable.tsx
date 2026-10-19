@@ -287,7 +287,13 @@ export const FBAStockTable: React.FC<FBAStockTableProps> = ({ data }) => {
           <div className="flex flex-wrap items-center gap-x-6 gap-y-4">
             <CoverageDaysSelector value={coverageDays} onChange={handleCoverageDaysChange} />
             <FactorAdjuster label="Safety Factor" value={safetyFactor} onChange={handleSafetyFactorChange} />
-            <FactorAdjuster label="Trend Factor" value={trendFactor} onChange={handleTrendFactorChange} />
+            <FactorAdjuster
+              label="Trend Factor"
+              value={trendFactor}
+              onChange={handleTrendFactorChange}
+              presets={[-30, -20, -10, 10, 20, 30]}
+              min={-100}
+            />
           </div>
           <div className="flex flex-wrap items-center justify-end gap-3">
             <div className="text-base text-slate-700">
